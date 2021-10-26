@@ -3,7 +3,6 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Ticker.h>
-#include <SDA5708.h>
 #include <ArduinoRS485.h> // ArduinoModbus depends on the ArduinoRS485 library
 #include <ArduinoModbus.h>
 #include <avr/wdt.h>
@@ -14,7 +13,7 @@
 #define ONE_WIRE_BUS 3
 #define TEMP_SENSOR_RESOLUTION 12
 #define MAX_SENSORS_COUNT 2
-#define PWM_OUT_PIN 8
+#define PWM_OUT_PIN 9
 #define PWM_MIN_DUTY_CYCLE 25
 #define PWM_MAX_DUTY_CYCLE 255
 #define SCREEN_WIDTH 128 
@@ -55,18 +54,11 @@ uint8_t sensorsCount;
 float currentMainTemp = 0;
 float lastMainTemp = 0;
 int tempErrorIdx = 0; // starts from 1
-int temperatureTrend = 0;
 bool firstLoop = true;
 Config cfg = {};
 
-
-
 void readTemperatures(void);
 void adjustFanSpeed(void);
-void printSpeedBar(int percentage);
-void drawArrowUp(uint8_t x, uint8_t y);
-void drawArrowDown(uint8_t x, uint8_t y);
-void printMainTemperature();
 void readConfig();
 void writeConfig();
 void setConfigDefaults();
@@ -75,15 +67,32 @@ void (*resetFunc)(void) = 0;
 
 Ticker readTemperatureTicker(readTemperatures, 750 / (1 << (12 - TEMP_SENSOR_RESOLUTION)), 0, MILLIS);
 Ticker adjustFanSpeedTicker(adjustFanSpeed, 1000, 0, MILLIS);
-SDA5708 display(4, 5, 6, 7);
 
 void setup()
 {
-  delay(1000);
   #ifdef DEBUG
+  delay(1000);
   Serial.begin(9600);
-  while(!Serial){}
+  while (!Serial) {}
+  Serial.println(F("MODBUS RS485 Fan Controller v.1.0.0"));
   #endif
+
+  sensors.begin();
+  sensorsCount = sensors.getDS18Count();
+
+#ifdef DEBUG
+  Serial.print(F("Found: "));
+  Serial.print(sensorsCount);
+  Serial.println(F(" temperature sensor(s)"));
+#endif
+
+  if (sensorsCount == 0) {
+    Serial.println("Set max fan speed!");
+    return;
+  };
+
+  sensors.requestTemperatures();
+  sensors.setWaitForConversion(false); // makes it async
   
   readConfig();
   if (strcmp(cfg.hash, CONFIG_HASH) != 0) {
@@ -93,36 +102,15 @@ void setup()
 
   // start the Modbus RTU server, with (slave) id 42
   if (!ModbusRTUServer.begin(cfg.modbusSlaveAddr, 9600)) {
-    while (1);
+    #ifdef DEBUG
+    Serial.println("MODBUS not initialized");
+    #endif
+    return;
   }
   ModbusRTUServer.configureInputRegisters(MODBUS_REG_START_ADDRESS, MAX_SENSORS_COUNT*2);
   ModbusRTUServer.configureHoldingRegisters(MODBUS_REG_START_ADDRESS, 4);
   updateModbusRegisters();
 
-  display.begin();
-  display.brightness(0);
-  display.print("Fan");
-  delay(1000);
-  display.print("Control");
-  delay(1000);
-  display.clear();
-  display.print("v1.0.0");
-  delay(1000);
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  sensors.begin();
-  sensorsCount = sensors.getDS18Count();
-  display.clear();
-  display.print("SENS: ");
-  display.printAt(String(sensorsCount).c_str(), 6);
-
-  if (sensorsCount == 0) return;
-  delay(2000);
-  sensors.requestTemperatures();
-  sensors.setWaitForConversion(false); // makes it async
-  
-  
-  display.clear();
   readTemperatureTicker.start();
   adjustFanSpeedTicker.start();
 
@@ -130,7 +118,6 @@ void setup()
   ModbusRTUServer.poll();
   wdt_enable(WDTO_2S);
 }
-
 
 void loop()
 {
@@ -179,16 +166,18 @@ void loop()
 void readTemperatures(void)
 {
   digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-  tempErrorIdx = 0;
   currentMainTemp = -127;
   for (int t = 0; t < min(sensorsCount, MAX_SENSORS_COUNT); t++)
   {
     DeviceAddress addr;
     sensors.getAddress(addr, t);
     if (!sensors.isConnected(addr)){
-      tempErrorIdx = t + 1;
-      temperatures[t] = -127;
-      
+      #ifdef DEBUG
+      Serial.print("Temp. sensor #");
+      Serial.print(t + 1);
+      Serial.println(" error");
+      #endif
+      temperatures[t] = -127;      
     } else {
       temperatures[t] = sensors.getTempC(addr);
       temperatureUnion.value = temperatures[t];
@@ -205,11 +194,7 @@ void readTemperatures(void)
 
 void adjustFanSpeed(void)
 {
-  
-  temperatureTrend = (int)(currentMainTemp * 10) - (int)(lastMainTemp * 10);
-  lastMainTemp = currentMainTemp;
-
-  int8_t percent = 0;
+  long percent = 0;
   long dutyCycle = 0;
   if (tempErrorIdx > 0) {
     dutyCycle = PWM_MAX_DUTY_CYCLE;
@@ -224,59 +209,17 @@ void adjustFanSpeed(void)
   }
   ModbusRTUServer.holdingRegisterWrite(MODBUS_REG_START_ADDRESS+MODBUS_OFFSET_FAN_SPEED, percent);
   
-  analogWrite(PWM_OUT_PIN, dutyCycle);
-
-  printMainTemperature();
-
-  printSpeedBar(percent);
-  
-}
-
-void printSpeedBar(int percent)
-{
-  display.setCyrsor(7);
-  long bars = map(percent, 0, 100, 0, 7);
-
-  for (uint8_t i = 0; i <= 7; i++) 
-  {
-    if (7 - i <= bars) {
-      display.sendByte(0b11111111 / 8);
-    } else {
-      display.sendByte(0b00000000 / 8);
-    }
+  analogWrite(PWM_OUT_PIN, dutyCycle); 
+  #ifdef DEBUG
+  if (lastMainTemp != currentMainTemp) {
+    Serial.print(F("PWM: "));
+    Serial.print(percent);
+    Serial.print(F("% temp: "));
+    Serial.print(currentMainTemp);
+    Serial.println("st. C");
   }
-}
-
-void drawArrowUp(uint8_t x, uint8_t y)
-{
-}
-
-void drawArrowDown(uint8_t x, uint8_t y)
-{
-}
-
-void printMainTemperature()
-{
-  char value[8] = "";
-  if (tempErrorIdx > 0) {
-    display.clear();
-    sprintf(value, "ERR T%d", tempErrorIdx);
-    
-  } else {
-    sprintf(value, "%d.%d", (int)currentMainTemp, int(currentMainTemp * 10) % 10);
-
-    if (temperatureTrend >= 0)
-    {
-      drawArrowUp(2, 28);
-    }
-    if (temperatureTrend <= 0)
-    {
-      drawArrowDown(2, 38);
-    }
-    display.print(value);
-    display.digit(127, 4);
-    display.printAt("   ", 5);
-  } 
+  #endif
+  lastMainTemp = currentMainTemp;
 }
 
 void readConfig() {
