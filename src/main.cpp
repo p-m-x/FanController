@@ -16,14 +16,12 @@
 #define PWM_OUT_PIN 9
 #define PWM_MIN_DUTY_CYCLE 25
 #define PWM_MAX_DUTY_CYCLE 255
-#define SCREEN_WIDTH 128 
-#define SCREEN_HEIGHT 64 
-#define SCREEN_ADDRESS 0x3c
 #define MODBUS_REG_START_ADDRESS 0x00
 #define MODBUS_OFFSET_DEV_ADDR 0
 #define MODBUS_OFFSET_MAX_TEMP 1
 #define MODBUS_OFFSET_TEMP_HYSTERESIS 2
 #define MODBUS_OFFSET_FAN_SPEED 3
+#define MODBUS_OFFSET_ERROR 4
 #define MODBUS_DEFAULT_SLAVE_ADDR 20
 #define CONFIG_HASH "gtrfdokyp"
 
@@ -53,7 +51,7 @@ float temperatures[MAX_SENSORS_COUNT];
 uint8_t sensorsCount;
 float currentMainTemp = 0;
 float lastMainTemp = 0;
-int tempErrorIdx = 0; // starts from 1
+bool tempSensError = false;
 bool firstLoop = true;
 Config cfg = {};
 
@@ -101,14 +99,14 @@ void setup()
   }
 
   // start the Modbus RTU server, with (slave) id 42
-  if (!ModbusRTUServer.begin(cfg.modbusSlaveAddr, 9600)) {
+  if (!ModbusRTUServer.begin(20, 9600)) {
     #ifdef DEBUG
     Serial.println("MODBUS not initialized");
     #endif
     return;
   }
   ModbusRTUServer.configureInputRegisters(MODBUS_REG_START_ADDRESS, MAX_SENSORS_COUNT*2);
-  ModbusRTUServer.configureHoldingRegisters(MODBUS_REG_START_ADDRESS, 4);
+  ModbusRTUServer.configureHoldingRegisters(MODBUS_REG_START_ADDRESS, 5);
   updateModbusRegisters();
 
   readTemperatureTicker.start();
@@ -177,13 +175,16 @@ void readTemperatures(void)
       Serial.print(t + 1);
       Serial.println(" error");
       #endif
-      temperatures[t] = -127;      
+      temperatures[t] = -127;    
+      tempSensError = true;  
     } else {
       temperatures[t] = sensors.getTempC(addr);
       temperatureUnion.value = temperatures[t];
       ModbusRTUServer.inputRegisterWrite(MODBUS_REG_START_ADDRESS + (t * 2), temperatureUnion.highOrderByte);
       ModbusRTUServer.inputRegisterWrite(MODBUS_REG_START_ADDRESS + (t * 2 + 1), temperatureUnion.lowOrderByte);
+      tempSensError = false;
     }
+    ModbusRTUServer.holdingRegisterWrite(MODBUS_REG_START_ADDRESS + MODBUS_OFFSET_ERROR, tempSensError);
     if (temperatures[t] > currentMainTemp) {
       currentMainTemp = temperatures[t];
     }
@@ -196,7 +197,7 @@ void adjustFanSpeed(void)
 {
   long percent = 0;
   long dutyCycle = 0;
-  if (tempErrorIdx > 0) {
+  if (tempSensError) {
     dutyCycle = PWM_MAX_DUTY_CYCLE;
     percent = 100;
   } 
